@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Algorithmic RCE Engine</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #121212; color: #e0e0e0; padding: 20px; margin: 0; }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        .port-input { background: #2d2d2d; color: white; border: 1px solid #555; padding: 8px; border-radius: 4px; font-family: monospace; }
+        .grid { display: grid; grid-template-columns: 3fr 2fr; gap: 20px; height: 80vh; }
+        .panel { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+        /* Removed textarea styling for code to avoid conflicts with Monaco */
+        #stdin { width: 100%; flex-grow: 0; height: 120px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #333; border-radius: 6px; padding: 15px; font-family: 'Courier New', Courier, monospace; font-size: 14px; resize: none; outline: none; box-sizing: border-box; }
+        #stdin:focus { border-color: #007acc; }
+        /* Monaco Editor Container Style */
+        #editor-container { width: 100%; flex-grow: 1; border: 1px solid #333; border-radius: 6px; overflow: hidden; }
+        
+        .output-box { flex-grow: 1; background: #000; border: 1px solid #333; border-radius: 6px; padding: 15px; font-family: 'Courier New', Courier, monospace; white-space: pre-wrap; overflow-y: auto; }
+        button { padding: 12px 24px; background: #007acc; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 14px; transition: background 0.2s; }
+        button:hover { background: #005999; }
+        button:disabled { background: #444; cursor: not-allowed; }
+        h3 { margin: 0; font-size: 16px; color: #aaa; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>⚡ Distributed Execution Engine</h2>
+        <div>
+            <label for="port">Minikube Port: </label>
+            <input type="text" id="port" class="port-input" placeholder="e.g., 59875" value="59875">
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="panel">
+            <h3>Source Code (C++)</h3>
+            <!-- Replaced textarea with Monaco container -->
+            <div id="editor-container"></div>
+            <button id="submitBtn" onclick="submitCode()">Run Code</button>
+        </div>
+
+        <div class="panel">
+            <h3>Standard Input (stdin)</h3>
+            <textarea id="stdin" spellcheck="false" placeholder="Enter input data here..."></textarea>
+            
+            <h3>Execution Status & Output</h3>
+            <div id="output" class="output-box">Waiting for submission...</div>
+        </div>
+    </div>
+
+    <!-- Load RequireJS first for Monaco AMD loader -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js"></script>
+    <script>
+        // Store the default C++ template
+        const defaultCode = `#include <iostream>\n#include <vector>\n#include <algorithm>\n\nusing namespace std;\n\nvoid solve() {\n    cout << "Hello from the browser frontend!\\n";\n}\n\nint main() {\n    // Optimize standard I/O operations for performance\n    ios_base::sync_with_stdio(false);\n    cin.tie(NULL);\n    \n    int t = 1;\n    // cin >> t;\n    while (t--) {\n        solve();\n    }\n    \n    return 0;\n}`;
+
+        // Initialize Monaco Editor
+        require.config({ paths: { 'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' }});
+        require(['vs/editor/editor.main'], function() {
+            window.editor = monaco.editor.create(document.getElementById('editor-container'), {
+                value: defaultCode,
+                language: 'cpp',
+                theme: 'vs-dark',
+                automaticLayout: true,
+                minimap: { enabled: false },
+                fontSize: 14,
+                padding: { top: 15 }
+            });
+        });
+
+        async function submitCode() {
+            const port = document.getElementById('port').value.trim();
+            // Pull code from Monaco instead of textarea
+            const code = window.editor.getValue();
+            const stdin = document.getElementById('stdin').value;
+            const outputDiv = document.getElementById('output');
+            const btn = document.getElementById('submitBtn');
+            
+            if (!port) {
+                outputDiv.innerText = "Error: Please enter your active Minikube tunnel port at the top right.";
+                return;
+            }
+
+            const baseUrl = `http://127.0.0.1:${port}`;
+            
+            btn.disabled = true;
+            btn.innerText = "Executing...";
+            outputDiv.innerHTML = `<span style="color: #007acc;">Submitting to Kubernetes queue...</span>`;
+
+            try {
+                const submitRes = await fetch(`${baseUrl}/submit`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source_code: code, input_data: stdin })
+                });
+                
+                const submitData = await submitRes.json();
+                if (!submitData.job_id) throw new Error(submitData.error || "Submission failed");
+                
+                pollStatus(baseUrl, submitData.job_id, outputDiv, btn);
+            } catch (err) {
+                btn.disabled = false;
+                btn.innerText = "Run Code";
+                outputDiv.innerHTML = `<span style="color: #ff5555;">Request Failed: ${err.message}</span>\n\n(Note: If it says 'Failed to fetch', your browser's CORS policy is blocking the request. See the troubleshooting step below!)`;
+            }
+        }
+
+        function pollStatus(baseUrl, jobId, outputDiv, btn) {
+            outputDiv.innerHTML = `<span style="color: #f39c12;">Job ID: ${jobId}</span>\nStatus: Queued (Streaming)...`;
+            
+            // Open a persistent, unidirectional stream to the new Flask endpoint
+            const eventSource = new EventSource(`${baseUrl}/stream/${jobId}`);
+            
+            // Listen for data pushed from the server
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                if (data.status === 'Finished' || data.status === 'Accepted' || data.status === 'SUCCESS') {
+                    eventSource.close(); // Close stream when done
+                    btn.disabled = false;
+                    btn.innerText = "Run Code";
+                    outputDiv.innerHTML = `<span style="color: #55ff55;">Status: ${data.status}</span>\n\n<span style="color: #ccc;">Output:</span>\n${data.result?.output || data.output || 'No output'}`;
+                } 
+                else if (data.status.toLowerCase().includes('error') || data.status === 'FAILURE') {
+                    eventSource.close(); // Close stream on error
+                    btn.disabled = false;
+                    btn.innerText = "Run Code";
+                    outputDiv.innerHTML = `<span style="color: #ff5555;">Execution Failed</span>\n\nError:\n${data.error || 'Check backend logs'}`;
+                } 
+                else {
+                    // Update the UI instantly as states change (e.g., Compiling... Running...)
+                    outputDiv.innerHTML = `<span style="color: #f39c12;">Job ID: ${jobId}</span>\nStatus: ${data.status}...`;
+                }
+            };
+
+            // Handle connection drops
+            eventSource.onerror = function(err) {
+                eventSource.close();
+                btn.disabled = false;
+                btn.innerText = "Run Code";
+                outputDiv.innerHTML += `\n<span style="color: #ff5555;">[Stream Disconnected]</span>`;
+            };
+        }
+    </script>
+</body>
+</html>
